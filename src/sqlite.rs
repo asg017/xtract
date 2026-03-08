@@ -19,6 +19,14 @@ fn sha256_hex(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{hash:x}"))
 }
 
+/// Open (or create) the database with WAL mode and create tables.
+pub fn open_db(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    create_tables(&conn)?;
+    Ok(conn)
+}
+
 fn upsert_document(conn: &Connection, opts: &InsertOpts) -> anyhow::Result<i64> {
     let sha256 = sha256_hex(opts.input_file)?;
     let filename = opts
@@ -40,11 +48,10 @@ fn upsert_document(conn: &Connection, opts: &InsertOpts) -> anyhow::Result<i64> 
     Ok(doc_id)
 }
 
-pub fn insert(db_path: &Path, result: &ExtractResult, opts: &InsertOpts) -> anyhow::Result<()> {
-    let conn = Connection::open(db_path)?;
-    create_tables(&conn)?;
-
-    let document_id = upsert_document(&conn, opts)?;
+/// Insert a single extraction result. Each call is its own transaction
+/// (SQLite autocommit), so the row is visible immediately.
+pub fn insert(conn: &Connection, result: &ExtractResult, opts: &InsertOpts) -> anyhow::Result<()> {
+    let document_id = upsert_document(conn, opts)?;
 
     let schema_json = serde_json::to_string(&result.json_schema)?;
     let schema_name = result
@@ -72,9 +79,13 @@ pub fn insert(db_path: &Path, result: &ExtractResult, opts: &InsertOpts) -> anyh
         |row| row.get(0),
     )?;
 
+    let image_sha256 = {
+        let hash = Sha256::digest(&result.image_bytes);
+        format!("{hash:x}")
+    };
     conn.execute(
-        "INSERT INTO images (mime_type, data) VALUES (?1, ?2)",
-        rusqlite::params![result.image_mime, result.image_bytes],
+        "INSERT INTO images (sha256, mime_type, data) VALUES (?1, ?2, ?3)",
+        rusqlite::params![image_sha256, result.image_mime, result.image_bytes],
     )?;
     let image_id = conn.last_insert_rowid();
 
@@ -94,6 +105,30 @@ pub fn insert(db_path: &Path, result: &ExtractResult, opts: &InsertOpts) -> anyh
             result.timing.finished_at,
             result.timing.elapsed_ms,
         ],
+    )?;
+
+    Ok(())
+}
+
+pub struct ErrorOpts<'a> {
+    pub input_file: &'a Path,
+    pub page: Option<u32>,
+    pub model: &'a str,
+    pub error: &'a str,
+}
+
+/// Insert an extraction error into the errors table.
+pub fn insert_error(conn: &Connection, opts: &ErrorOpts) -> anyhow::Result<()> {
+    let filename = opts
+        .input_file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    conn.execute(
+        "INSERT INTO errors (filename, page, model, error, created_at)
+         VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        rusqlite::params![filename, opts.page, opts.model, opts.error],
     )?;
 
     Ok(())
@@ -122,6 +157,7 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
 
         CREATE TABLE IF NOT EXISTS images (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            sha256    TEXT NOT NULL,
             mime_type TEXT NOT NULL,
             data      BLOB NOT NULL
         );
@@ -140,6 +176,15 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
             started_at      TEXT,
             finished_at     TEXT,
             elapsed_ms      INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS errors (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename   TEXT NOT NULL,
+            page       INTEGER,
+            model      TEXT NOT NULL,
+            error      TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );",
     )?;
     Ok(())

@@ -20,16 +20,16 @@ pub enum Command {
         /// Path to the .md recipe file
         file: PathBuf,
     },
-    /// Extract structured data from an image or PDF using a Zod schema via an LLM provider
+    /// Extract structured data from images/PDFs using a schema via an LLM provider
     ///
-    /// Two modes:
-    ///   1. extract <input> <schema.js> --prompt "..."
-    ///   2. extract <input.md>  (markdown with ```schema blocks)
+    /// Usage:
+    ///   extract <schema.js> <inputs...> --prompt "..."
+    ///   extract <recipe.md> <inputs...>
     Extract {
-        /// Path to an image, PDF, or markdown file (or "clipboard" to read from clipboard)
-        input: PathBuf,
-        /// Path to a .js Zod schema file (not needed when input is .md)
-        schema: Option<PathBuf>,
+        /// Path to a .js Zod schema file or .md recipe file
+        schema: PathBuf,
+        /// Image/PDF paths to extract from (or "clipboard" to read from clipboard)
+        inputs: Vec<PathBuf>,
         /// Prompt telling the model what to extract (not needed when input is .md)
         #[arg(long)]
         prompt: Option<String>,

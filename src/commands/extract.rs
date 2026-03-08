@@ -1,10 +1,14 @@
 use base64::Engine;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::js_runner;
 use crate::markdown;
 use crate::markdown::CropRegion;
+use crate::pages;
+use crate::progress::{Progress, Worker};
+use crate::sqlite;
 
 pub struct ProviderConfig {
     pub base_url: String,
@@ -39,8 +43,8 @@ pub fn resolve_provider(provider: &str) -> anyhow::Result<ProviderConfig> {
 }
 
 pub struct ExtractArgs<'a> {
+    pub schema: &'a Path,
     pub input: &'a Path,
-    pub schema: Option<&'a Path>,
     pub prompt: Option<&'a str>,
     pub model: &'a str,
     pub provider: &'a ProviderConfig,
@@ -70,20 +74,17 @@ pub struct ExtractResult {
     pub timing: ApiTiming,
 }
 
-pub fn run(args: &ExtractArgs) -> anyhow::Result<ExtractResult> {
-    let is_md = matches!(
-        args.input.extension().and_then(|e| e.to_str()),
+pub fn is_md_schema(schema: &Path) -> bool {
+    matches!(
+        schema.extension().and_then(|e| e.to_str()),
         Some("md" | "markdown")
-    );
+    )
+}
 
-    if is_md {
+pub fn run(args: &ExtractArgs) -> anyhow::Result<ExtractResult> {
+    if is_md_schema(args.schema) {
         return run_markdown(args);
     }
-
-    // Non-markdown mode: schema is required
-    let schema_path = args
-        .schema
-        .ok_or_else(|| anyhow::anyhow!("Schema file is required (or use a .md file as input)"))?;
 
     let prompt = args
         .prompt
@@ -91,7 +92,7 @@ pub fn run(args: &ExtractArgs) -> anyhow::Result<ExtractResult> {
         .to_string();
 
     let (image_bytes, mime) = get_image_bytes(args.input, args.page, args.screenshot)?;
-    let json_schema: serde_json::Value = serde_json::from_str(&js_runner::run(schema_path)?)?;
+    let json_schema: serde_json::Value = serde_json::from_str(&js_runner::run(args.schema)?)?;
 
     let (data, timing) = call_api(&image_bytes, &mime, &json_schema, &prompt, args.model, args.provider)?;
     Ok(ExtractResult {
@@ -105,22 +106,13 @@ pub fn run(args: &ExtractArgs) -> anyhow::Result<ExtractResult> {
 }
 
 fn run_markdown(args: &ExtractArgs) -> anyhow::Result<ExtractResult> {
-    let md_text = std::fs::read_to_string(args.input)?;
+    let md_text = std::fs::read_to_string(args.schema)?;
     let parsed = markdown::parse(&md_text)?;
     let section = markdown::resolve_section(&parsed.sections, args.name)?;
 
-    // The schema content from the ```schema block could be Zod JS or raw JSON Schema
     let json_schema = parse_schema_content(&section.schema)?;
 
-    // We need an image/PDF input — check the second positional arg
-    let image_path = args.schema.ok_or_else(|| {
-        anyhow::anyhow!(
-            "When using a markdown file, provide the image/PDF path as the second argument:\n  \
-             schema-extract extract recipe.md photo.jpg"
-        )
-    })?;
-
-    let (image_bytes, mime) = get_image_bytes(image_path, args.page, args.screenshot)?;
+    let (image_bytes, mime) = get_image_bytes(args.input, args.page, args.screenshot)?;
     let prompt = section.prompt.to_string();
 
     let (data, timing) = call_api(&image_bytes, &mime, &json_schema, &prompt, args.model, args.provider)?;
@@ -297,7 +289,11 @@ pub fn call_api(
     });
 
     let url = format!("{}/chat/completions", provider.base_url);
-    let mut req = ureq::post(&url)
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut req = agent.post(&url)
         .header("Content-Type", "application/json");
     if let Some(ref api_key) = provider.api_key {
         req = req.header("Authorization", &format!("Bearer {api_key}"));
@@ -306,10 +302,22 @@ pub fn call_api(
     let started_at = now_iso();
     let start = Instant::now();
 
-    let response: serde_json::Value = req
-        .send_json(&body)?
-        .body_mut()
-        .read_json()?;
+    let mut resp = req.send_json(&body)?;
+    let status = resp.status().as_u16();
+    if status < 200 || status >= 300 {
+        let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+        // Try to pretty-print JSON error, otherwise show raw body
+        let detail = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+            serde_json::to_string_pretty(&v).unwrap_or(body_text)
+        } else {
+            body_text
+        };
+        let img_kb = image_bytes.len() / 1024;
+        anyhow::bail!(
+            "API returned HTTP {status} (model={model}, image={img_kb}KB {mime}):\n{detail}"
+        );
+    }
+    let response: serde_json::Value = resp.body_mut().read_json()?;
 
     let elapsed = start.elapsed();
     let finished_at = now_iso();
@@ -578,5 +586,563 @@ fn resolve_to_dict<'a>(
             }
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command-level orchestration (multi-input, multi-page, classifier)
+// ---------------------------------------------------------------------------
+
+pub struct CommandArgs {
+    pub schema: PathBuf,
+    pub inputs: Vec<PathBuf>,
+    pub prompt: Option<String>,
+    pub model: String,
+    pub provider: String,
+    pub page: Option<u32>,
+    pub pages: Option<String>,
+    pub screenshot: bool,
+    pub name: Option<String>,
+    pub output: Option<PathBuf>,
+    pub concurrency: usize,
+}
+
+fn is_pdf(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("pdf" | "PDF")
+    )
+}
+
+pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
+    if args.inputs.is_empty() {
+        anyhow::bail!("At least one input file is required");
+    }
+
+    let provider_config = resolve_provider(&args.provider)?;
+    let is_sqlite = args
+        .output
+        .as_ref()
+        .is_some_and(|p| p.extension().is_some_and(|e| e == "db"));
+
+    let is_md = is_md_schema(&args.schema);
+
+    // Open DB once with WAL mode if SQLite output is requested
+    let db = if is_sqlite {
+        Some(Mutex::new(sqlite::open_db(args.output.as_ref().unwrap())?))
+    } else {
+        None
+    };
+
+    // Check if markdown has a page_classifier (needs early parse)
+    let md_parsed = if is_md {
+        let md_text = std::fs::read_to_string(&args.schema)?;
+        Some(markdown::parse(&md_text)?)
+    } else {
+        None
+    };
+
+    let has_classifier = md_parsed
+        .as_ref()
+        .is_some_and(|p| p.frontmatter.page_classifier.is_some());
+
+    // Classifier mode
+    if has_classifier {
+        let image_path = &args.inputs[0];
+
+        if !is_pdf(image_path) {
+            anyhow::bail!("page_classifier requires a PDF input");
+        }
+        if !is_sqlite {
+            anyhow::bail!("page_classifier requires SQLite output (-o <path>.db)");
+        }
+
+        let parsed = md_parsed.as_ref().unwrap();
+        let classifier_name = parsed.frontmatter.page_classifier.as_deref().unwrap();
+        let crop = parsed.frontmatter.classifier_crop.as_ref();
+
+        let page_count = pdf_page_count(image_path)? as u32;
+        let page_list: Vec<u32> = if let Some(ref spec) = args.pages {
+            pages::parse_page_spec(spec, page_count)?
+        } else if let Some(p) = args.page {
+            vec![p]
+        } else {
+            (1..=page_count).collect()
+        };
+
+        let total = page_list.len();
+        let nc = args.concurrency.min(total).max(1);
+        let provider = &args.provider;
+        let model = &args.model;
+        let screenshot = args.screenshot;
+        let db = db.as_ref().unwrap();
+
+        let cr = run_concurrent(nc, &page_list, |page_num, w| {
+            w.status(page_num, "rendering page");
+            let (image_bytes, _mime) =
+                get_image_bytes(image_path, Some(page_num), true)?;
+
+            let classifier_image = if let Some(crop) = crop {
+                w.status(page_num, "cropping for classifier");
+                crop_image(&image_bytes, crop)?
+            } else {
+                image_bytes
+            };
+
+            w.status(page_num, &format!("classifying via {provider}"));
+            let classifier_section =
+                markdown::find_section(&parsed.sections, classifier_name)?;
+            let classifier_schema =
+                parse_schema_content(&classifier_section.schema)?;
+            let (classifier_json, _) = call_api(
+                &classifier_image,
+                "image/png",
+                &classifier_schema,
+                &classifier_section.prompt,
+                model,
+                &provider_config,
+            )?;
+
+            let classifier_value: serde_json::Value =
+                serde_json::from_str(&classifier_json)?;
+            let page_type = classifier_value
+                .get("page_type")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "p{page_num}: classifier did not return \"page_type\"; got: {classifier_json}"
+                    )
+                })?
+                .to_string();
+
+            if page_type.eq_ignore_ascii_case(classifier_name) {
+                anyhow::bail!(
+                    "p{page_num}: classifier returned page_type=\"{page_type}\" \
+                     which is the classifier itself (infinite loop)"
+                );
+            }
+
+            let target_section =
+                markdown::find_section(&parsed.sections, &page_type)
+                    .map_err(|_| {
+                        let valid: Vec<_> = parsed
+                            .sections
+                            .iter()
+                            .filter(|s| !s.name.eq_ignore_ascii_case(classifier_name))
+                            .map(|s| s.name.as_str())
+                            .collect();
+                        anyhow::anyhow!(
+                            "p{page_num}: classifier returned page_type=\"{page_type}\" \
+                             which is not a known section; valid: {}",
+                            valid.join(", ")
+                        )
+                    })?;
+
+            w.status(page_num, &format!("extracting \"{page_type}\" via {provider}"));
+            let (full_image, full_mime) =
+                get_image_bytes(image_path, Some(page_num), screenshot)?;
+            let target_schema =
+                parse_schema_content(&target_section.schema)?;
+            let (data, timing) = call_api(
+                &full_image,
+                &full_mime,
+                &target_schema,
+                &target_section.prompt,
+                model,
+                &provider_config,
+            )?;
+
+            let result = ExtractResult {
+                data,
+                json_schema: target_schema,
+                prompt: target_section.prompt.clone(),
+                image_bytes: full_image,
+                image_mime: full_mime,
+                timing,
+            };
+
+            // Insert immediately, holding the lock only for the insert
+            {
+                let conn = db.lock().unwrap();
+                sqlite::insert(
+                    &conn,
+                    &result,
+                    &sqlite::InsertOpts {
+                        input_file: image_path,
+                        page: Some(page_num),
+                        page_count: Some(page_count),
+                        model,
+                        classifier_data: Some(&classifier_json),
+                    },
+                )?;
+            }
+
+            Ok(())
+        }, |page_num, e| {
+            eprintln!("  page {page_num}: {e:#}");
+            let conn = db.lock().unwrap();
+            let _ = sqlite::insert_error(&conn, &sqlite::ErrorOpts {
+                input_file: image_path,
+                page: Some(page_num),
+                model,
+                error: &format!("{e:#}"),
+            });
+        });
+
+        let msg = if cr.error_count > 0 {
+            format!(
+                "Classified and extracted {} pages ({} errors) into {}",
+                total - cr.error_count, cr.error_count, args.output.as_ref().unwrap().display()
+            )
+        } else {
+            format!(
+                "Classified and extracted {total} pages into {}",
+                args.output.as_ref().unwrap().display()
+            )
+        };
+        cr.prog.finish(&msg);
+        return Ok(());
+    }
+
+    // --- Non-classifier flow ---
+
+    // For a single input, use the simple path
+    if args.inputs.len() == 1 {
+        let input = &args.inputs[0];
+        let is_clip = is_clipboard(input);
+        let input_is_pdf = !is_clip && is_pdf(input);
+
+        let page_list: Vec<u32> = if let Some(ref spec) = args.pages {
+            if !input_is_pdf {
+                anyhow::bail!("--pages is only valid for PDF files");
+            }
+            let count = pdf_page_count(input)? as u32;
+            pages::parse_page_spec(spec, count)?
+        } else if let Some(p) = args.page {
+            vec![p]
+        } else if input_is_pdf && is_sqlite {
+            let count = pdf_page_count(input)? as u32;
+            (1..=count).collect()
+        } else {
+            vec![]
+        };
+
+        if page_list.len() > 1 && !is_sqlite {
+            anyhow::bail!("Multiple pages require SQLite output (-o <path>.db)");
+        }
+
+        // Single-page path
+        if page_list.len() <= 1 {
+            let effective_page = page_list.first().copied().or(args.page);
+            let ea = ExtractArgs {
+                schema: &args.schema,
+                input,
+                prompt: args.prompt.as_deref(),
+                model: &args.model,
+                provider: &provider_config,
+                page: effective_page,
+                screenshot: args.screenshot,
+                name: args.name.as_deref(),
+            };
+            let result = run(&ea)?;
+
+            eprintln!(
+                "Extracted in {}ms ({} → {})",
+                result.timing.elapsed_ms, result.timing.started_at, result.timing.finished_at,
+            );
+
+            if let Some(ref db) = db {
+                let conn = db.lock().unwrap();
+                let page_count = if input_is_pdf {
+                    Some(pdf_page_count(input)? as u32)
+                } else {
+                    None
+                };
+                sqlite::insert(
+                    &conn,
+                    &result,
+                    &sqlite::InsertOpts {
+                        input_file: input,
+                        page: effective_page,
+                        page_count,
+                        model: &args.model,
+                        classifier_data: None,
+                    },
+                )?;
+                eprintln!("Inserted into {}", args.output.as_ref().unwrap().display());
+            } else if let Some(path) = &args.output {
+                std::fs::write(path, &result.data)?;
+                eprintln!("Wrote {}", path.display());
+            } else {
+                println!("{}", result.data);
+            }
+
+            return Ok(());
+        }
+
+        // Multi-page SQLite path (concurrent)
+        let total = page_list.len();
+        let nc = args.concurrency.min(total).max(1);
+
+        let json_schema: serde_json::Value = if is_md {
+            let md_text = std::fs::read_to_string(&args.schema)?;
+            let parsed = markdown::parse(&md_text)?;
+            let section =
+                markdown::resolve_section(&parsed.sections, args.name.as_deref())?;
+            parse_schema_content(&section.schema)?
+        } else {
+            serde_json::from_str(&js_runner::run(&args.schema)?)?
+        };
+
+        let prompt_str = args
+            .prompt
+            .as_deref()
+            .unwrap_or("Extract the structured data from this image.");
+        let model = &args.model;
+        let provider = &args.provider;
+        let screenshot = args.screenshot;
+        let db = db.as_ref().unwrap();
+        let page_count = if input_is_pdf {
+            Some(pdf_page_count(input)? as u32)
+        } else {
+            None
+        };
+
+        let cr = run_concurrent(nc, &page_list, |page_num, w| {
+            w.status(page_num, "extracting image");
+            let (image_bytes, mime) =
+                get_image_bytes(input, Some(page_num), screenshot)?;
+
+            w.status(page_num, &format!("calling {provider}"));
+            let (data, timing) =
+                call_api(&image_bytes, &mime, &json_schema, prompt_str, model, &provider_config)?;
+
+            let result = ExtractResult {
+                data,
+                json_schema: json_schema.clone(),
+                prompt: prompt_str.to_string(),
+                image_bytes,
+                image_mime: mime,
+                timing,
+            };
+
+            {
+                let conn = db.lock().unwrap();
+                sqlite::insert(
+                    &conn,
+                    &result,
+                    &sqlite::InsertOpts {
+                        input_file: input,
+                        page: Some(page_num),
+                        page_count,
+                        model,
+                        classifier_data: None,
+                    },
+                )?;
+            }
+
+            Ok(())
+        }, |page_num, e| {
+            eprintln!("  page {page_num}: {e:#}");
+            let conn = db.lock().unwrap();
+            let _ = sqlite::insert_error(&conn, &sqlite::ErrorOpts {
+                input_file: input,
+                page: Some(page_num),
+                model,
+                error: &format!("{e:#}"),
+            });
+        });
+
+        let msg = if cr.error_count > 0 {
+            format!(
+                "Extracted {} pages ({} errors) into {}",
+                total - cr.error_count, cr.error_count, args.output.as_ref().unwrap().display()
+            )
+        } else {
+            format!(
+                "Extracted {total} pages into {}",
+                args.output.as_ref().unwrap().display()
+            )
+        };
+        cr.prog.finish(&msg);
+        return Ok(());
+    }
+
+    // --- Multiple inputs ---
+    if !is_sqlite {
+        anyhow::bail!("Multiple inputs require SQLite output (-o <path>.db)");
+    }
+    let db = db.as_ref().unwrap();
+
+    for input in &args.inputs {
+        let is_clip = is_clipboard(input);
+        let input_is_pdf = !is_clip && is_pdf(input);
+
+        let page_list: Vec<u32> = if let Some(ref spec) = args.pages {
+            if !input_is_pdf {
+                anyhow::bail!("--pages is only valid for PDF files");
+            }
+            let count = pdf_page_count(input)? as u32;
+            pages::parse_page_spec(spec, count)?
+        } else if let Some(p) = args.page {
+            vec![p]
+        } else if input_is_pdf {
+            let count = pdf_page_count(input)? as u32;
+            (1..=count).collect()
+        } else {
+            vec![0] // sentinel for non-PDF single image
+        };
+
+        let json_schema: serde_json::Value = if is_md {
+            let md_text = std::fs::read_to_string(&args.schema)?;
+            let parsed = markdown::parse(&md_text)?;
+            let section =
+                markdown::resolve_section(&parsed.sections, args.name.as_deref())?;
+            parse_schema_content(&section.schema)?
+        } else {
+            serde_json::from_str(&js_runner::run(&args.schema)?)?
+        };
+
+        let prompt_str = args
+            .prompt
+            .as_deref()
+            .unwrap_or("Extract the structured data from this image.");
+        let model = &args.model;
+        let provider = &args.provider;
+        let screenshot = args.screenshot;
+        let page_count = if input_is_pdf {
+            Some(pdf_page_count(input)? as u32)
+        } else {
+            None
+        };
+
+        let total = page_list.len();
+        let nc = args.concurrency.min(total).max(1);
+
+        let cr = run_concurrent(nc, &page_list, |page_num, w| {
+            let effective_page = if page_num == 0 { None } else { Some(page_num) };
+            w.status(page_num, "extracting image");
+            let (image_bytes, mime) =
+                get_image_bytes(input, effective_page, screenshot)?;
+
+            w.status(page_num, &format!("calling {provider}"));
+            let (data, timing) =
+                call_api(&image_bytes, &mime, &json_schema, prompt_str, model, &provider_config)?;
+
+            let result = ExtractResult {
+                data,
+                json_schema: json_schema.clone(),
+                prompt: prompt_str.to_string(),
+                image_bytes,
+                image_mime: mime,
+                timing,
+            };
+
+            {
+                let conn = db.lock().unwrap();
+                sqlite::insert(
+                    &conn,
+                    &result,
+                    &sqlite::InsertOpts {
+                        input_file: input,
+                        page: effective_page,
+                        page_count,
+                        model,
+                        classifier_data: None,
+                    },
+                )?;
+            }
+
+            Ok(())
+        }, |page_num, e| {
+            let effective_page = if page_num == 0 { None } else { Some(page_num) };
+            eprintln!("  {}: {e:#}", input.display());
+            let conn = db.lock().unwrap();
+            let _ = sqlite::insert_error(&conn, &sqlite::ErrorOpts {
+                input_file: input,
+                page: effective_page,
+                model,
+                error: &format!("{e:#}"),
+            });
+        });
+
+        let msg = if cr.error_count > 0 {
+            format!(
+                "Extracted {} from {} ({} errors) into {}",
+                total - cr.error_count, input.display(), cr.error_count,
+                args.output.as_ref().unwrap().display()
+            )
+        } else {
+            format!(
+                "Extracted {} from {} into {}",
+                total, input.display(), args.output.as_ref().unwrap().display()
+            )
+        };
+        cr.prog.finish(&msg);
+    }
+
+    Ok(())
+}
+
+struct ConcurrentResult {
+    prog: Progress,
+    error_count: usize,
+}
+
+/// Process pages concurrently with up to `nc` worker threads.
+/// The callback should handle its own persistence (e.g. SQLite inserts).
+/// On error, `on_error` is called and work continues with the remaining pages.
+fn run_concurrent<F, E>(
+    nc: usize,
+    page_list: &[u32],
+    process: F,
+    on_error: E,
+) -> ConcurrentResult
+where
+    F: Fn(u32, &Worker<'_>) -> anyhow::Result<()> + Sync,
+    E: Fn(u32, &anyhow::Error) + Sync,
+{
+    let total = page_list.len();
+    let prog = Progress::new(total, nc);
+    let work = Mutex::new(page_list.iter().copied());
+    let error_count = std::sync::atomic::AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for worker_idx in 0..nc {
+            let work = &work;
+            let prog = &prog;
+            let process = &process;
+            let on_error = &on_error;
+            let error_count = &error_count;
+
+            s.spawn(move || {
+                let w = prog.worker(worker_idx);
+                loop {
+                    let page_num = {
+                        let mut iter = work.lock().unwrap();
+                        iter.next()
+                    };
+                    let Some(page_num) = page_num else {
+                        break;
+                    };
+
+                    match process(page_num, &w) {
+                        Ok(()) => {
+                            w.complete_page();
+                        }
+                        Err(e) => {
+                            on_error(page_num, &e);
+                            error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            w.complete_page();
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    ConcurrentResult {
+        prog,
+        error_count: error_count.load(std::sync::atomic::Ordering::Relaxed),
     }
 }

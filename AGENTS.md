@@ -23,10 +23,13 @@ js/                — JS bundle for Zod runtime (built from js/entry.js via bui
 viewer/            — Svelte/SvelteKit web frontend for viewing results
 ```
 
-Extract supports three input modes:
-1. **Image**: `extract photo.jpg schema.js --prompt "..."`
-2. **PDF**: `extract doc.pdf schema.js --prompt "..." [--page N] [--screenshot]`
+Extract supports three input modes (schema always comes first):
+1. **Image**: `extract schema.js photo.jpg --prompt "..."`
+2. **PDF**: `extract schema.js doc.pdf --prompt "..." [--page N] [--screenshot]`
 3. **Markdown**: `extract recipe.md doc.pdf [--page N] [--name section]` — .md file contains prompt text and ` ```schema ` blocks (Zod or raw JSON Schema), no separate `--prompt`/schema args needed
+
+Multiple inputs supported: `extract schema.js *.pdf -o results.db`
+Clipboard input: `extract schema.js clipboard --prompt "..."`
 
 ## Building & Testing
 
