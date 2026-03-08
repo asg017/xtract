@@ -26,7 +26,7 @@ pub enum Command {
     ///   1. extract <input> <schema.js> --prompt "..."
     ///   2. extract <input.md>  (markdown with ```schema blocks)
     Extract {
-        /// Path to the image, PDF, or markdown file
+        /// Path to an image, PDF, or markdown file (or "clipboard" to read from clipboard)
         input: PathBuf,
         /// Path to a .js Zod schema file (not needed when input is .md)
         schema: Option<PathBuf>,

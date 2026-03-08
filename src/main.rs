@@ -43,12 +43,14 @@ fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .is_some_and(|p| p.extension().is_some_and(|e| e == "db"));
 
-            let is_pdf = matches!(
+            let is_clipboard = extract::is_clipboard(&input);
+
+            let is_pdf = !is_clipboard && matches!(
                 input.extension().and_then(|e| e.to_str()),
                 Some("pdf" | "PDF")
             );
 
-            let is_md = matches!(
+            let is_md = !is_clipboard && matches!(
                 input.extension().and_then(|e| e.to_str()),
                 Some("md" | "markdown")
             );

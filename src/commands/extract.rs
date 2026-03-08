@@ -180,11 +180,25 @@ pub fn pdf_page_count(input: &Path) -> anyhow::Result<usize> {
     Ok(doc.get_page_refs().len())
 }
 
+pub fn is_clipboard(input: &Path) -> bool {
+    input.as_os_str() == "clipboard"
+}
+
 pub fn get_image_bytes(
     input: &Path,
     page: Option<u32>,
     screenshot: bool,
 ) -> anyhow::Result<(Vec<u8>, String)> {
+    if is_clipboard(input) {
+        if page.is_some() {
+            anyhow::bail!("--page is not valid with clipboard input");
+        }
+        if screenshot {
+            anyhow::bail!("--screenshot is not valid with clipboard input");
+        }
+        return read_clipboard_image();
+    }
+
     let is_pdf = matches!(
         input.extension().and_then(|e| e.to_str()),
         Some("pdf" | "PDF")
@@ -209,6 +223,25 @@ pub fn get_image_bytes(
         };
         Ok((bytes, mime.to_string()))
     }
+}
+
+fn read_clipboard_image() -> anyhow::Result<(Vec<u8>, String)> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|e| anyhow::anyhow!("Failed to access clipboard: {e}"))?;
+    let img_data = clipboard
+        .get_image()
+        .map_err(|_| anyhow::anyhow!("No image found in clipboard"))?;
+
+    let img = image::RgbaImage::from_raw(
+        img_data.width as u32,
+        img_data.height as u32,
+        img_data.bytes.into_owned(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("Failed to construct image from clipboard data"))?;
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png)?;
+    Ok((buf.into_inner(), "image/png".to_string()))
 }
 
 fn now_iso() -> String {

@@ -25,3 +25,4 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 indicatif = "0.17"
 sha2 = "0.10"
 console = "0.15"
+arboard = "3.6.1"
