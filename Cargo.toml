@@ -26,3 +26,8 @@ indicatif = "0.17"
 sha2 = "0.10"
 console = "0.15"
 arboard = "3.6.1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

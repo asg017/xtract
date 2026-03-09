@@ -1,0 +1,3 @@
+- name: Install JS dependencies
+  run: npm ci
+  working-directory: js
