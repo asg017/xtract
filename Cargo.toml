@@ -1,6 +1,6 @@
 [package]
 name = "xtract"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "Extract structured data from PDFs using LLMs and schemas"
 license = "MIT OR Apache-2.0"
