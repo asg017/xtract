@@ -57,5 +57,8 @@ pub enum Command {
         /// Number of concurrent pages to process (default 8)
         #[arg(short = 'n', long = "nc", default_value = "8")]
         concurrency: usize,
+        /// Re-extract even if results already exist in the database
+        #[arg(long)]
+        force: bool,
     },
 }

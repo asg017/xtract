@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
             name,
             output,
             concurrency,
+            force,
         } => extract::run_command(extract::CommandArgs {
             schema,
             inputs,
@@ -39,6 +40,7 @@ fn main() -> anyhow::Result<()> {
             name,
             output,
             concurrency,
+            force,
         }),
     }
 }

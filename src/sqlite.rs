@@ -89,12 +89,13 @@ pub fn insert(conn: &Connection, result: &ExtractResult, opts: &InsertOpts) -> a
     )?;
     let image_id = conn.last_insert_rowid();
 
+    let page = opts.page.unwrap_or(0) as i64;
     conn.execute(
         "INSERT INTO extractions (document_id, page, model, schema_id, prompt_id, image_id, created_at, classifier_data, data, started_at, finished_at, elapsed_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             document_id,
-            opts.page,
+            page,
             opts.model,
             schema_id,
             prompt_id,
@@ -132,6 +133,83 @@ pub fn insert_error(conn: &Connection, opts: &ErrorOpts) -> anyhow::Result<()> {
     )?;
 
     Ok(())
+}
+
+pub struct ExistsCheck<'a> {
+    pub input_file: &'a Path,
+    pub page: Option<u32>,
+    pub page_count: Option<u32>,
+    pub model: &'a str,
+    pub schema_json: &'a str,
+    pub prompt: &'a str,
+}
+
+/// Returns true if an extraction already exists for this exact combination.
+pub fn extraction_exists(conn: &Connection, check: &ExistsCheck) -> anyhow::Result<bool> {
+    let document_id = upsert_document(
+        conn,
+        &InsertOpts {
+            input_file: check.input_file,
+            page: check.page,
+            page_count: check.page_count,
+            model: check.model,
+            classifier_data: None,
+        },
+    )?;
+
+    let schema_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM schemas WHERE schema = ?1",
+            [check.schema_json],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let prompt_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM prompts WHERE prompt = ?1",
+            [check.prompt],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let (Some(schema_id), Some(prompt_id)) = (schema_id, prompt_id) else {
+        return Ok(false);
+    };
+
+    let page = check.page.unwrap_or(0) as i64;
+    let exists: bool = conn.query_row(
+        "SELECT 1 FROM extractions WHERE document_id = ?1 AND page = ?2 AND model = ?3 AND schema_id = ?4 AND prompt_id = ?5 LIMIT 1",
+        rusqlite::params![document_id, page, check.model, schema_id, prompt_id],
+        |_| Ok(true),
+    ).unwrap_or(false);
+
+    Ok(exists)
+}
+
+/// Returns true if any extraction exists for this document + page + model,
+/// regardless of schema/prompt. Used in classifier mode to skip both
+/// classification and extraction when a result already exists.
+pub fn extraction_exists_any(conn: &Connection, input_file: &Path, page: Option<u32>, page_count: Option<u32>, model: &str) -> anyhow::Result<bool> {
+    let document_id = upsert_document(
+        conn,
+        &InsertOpts {
+            input_file,
+            page,
+            page_count,
+            model,
+            classifier_data: None,
+        },
+    )?;
+
+    let page = page.unwrap_or(0) as i64;
+    let exists: bool = conn.query_row(
+        "SELECT 1 FROM extractions WHERE document_id = ?1 AND page = ?2 AND model = ?3 LIMIT 1",
+        rusqlite::params![document_id, page, model],
+        |_| Ok(true),
+    ).unwrap_or(false);
+
+    Ok(exists)
 }
 
 fn create_tables(conn: &Connection) -> anyhow::Result<()> {
@@ -177,6 +255,9 @@ fn create_tables(conn: &Connection) -> anyhow::Result<()> {
             finished_at     TEXT,
             elapsed_ms      INTEGER
         );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_extractions_dedup
+            ON extractions(document_id, page, model, schema_id, prompt_id);
 
         CREATE TABLE IF NOT EXISTS errors (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,

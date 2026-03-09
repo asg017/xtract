@@ -605,6 +605,7 @@ pub struct CommandArgs {
     pub name: Option<String>,
     pub output: Option<PathBuf>,
     pub concurrency: usize,
+    pub force: bool,
 }
 
 fn is_pdf(path: &Path) -> bool {
@@ -677,7 +678,18 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
         let screenshot = args.screenshot;
         let db = db.as_ref().unwrap();
 
+        let force = args.force;
+
         let cr = run_concurrent(nc, &page_list, |page_num, w| {
+            if !force {
+                let conn = db.lock().unwrap();
+                if sqlite::extraction_exists_any(&conn, image_path, Some(page_num), Some(page_count), model)? {
+                    drop(conn);
+                    w.status(page_num, "skipped (exists)");
+                    return Ok(true);
+                }
+            }
+
             w.status(page_num, "rendering page");
             let (image_bytes, _mime) =
                 get_image_bytes(image_path, Some(page_num), true)?;
@@ -738,11 +750,12 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
                         )
                     })?;
 
+            let target_schema =
+                parse_schema_content(&target_section.schema)?;
+
             w.status(page_num, &format!("extracting \"{page_type}\" via {provider}"));
             let (full_image, full_mime) =
                 get_image_bytes(image_path, Some(page_num), screenshot)?;
-            let target_schema =
-                parse_schema_content(&target_section.schema)?;
             let (data, timing) = call_api(
                 &full_image,
                 &full_mime,
@@ -777,7 +790,7 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
                 )?;
             }
 
-            Ok(())
+            Ok(false)
         }, |page_num, e| {
             eprintln!("  page {page_num}: {e:#}");
             let conn = db.lock().unwrap();
@@ -789,17 +802,11 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
             });
         });
 
-        let msg = if cr.error_count > 0 {
-            format!(
-                "Classified and extracted {} pages ({} errors) into {}",
-                total - cr.error_count, cr.error_count, args.output.as_ref().unwrap().display()
-            )
-        } else {
-            format!(
-                "Classified and extracted {total} pages into {}",
-                args.output.as_ref().unwrap().display()
-            )
-        };
+        let msg = format_summary(
+            "Classified and extracted",
+            total, cr.skip_count, cr.error_count,
+            &format!("into {}", args.output.as_ref().unwrap().display()),
+        );
         cr.prog.finish(&msg);
         return Ok(());
     }
@@ -834,6 +841,39 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
         // Single-page path
         if page_list.len() <= 1 {
             let effective_page = page_list.first().copied().or(args.page);
+
+            // Dedup check for SQLite output
+            if !args.force && db.is_some() && !is_clip {
+                let page_count = if input_is_pdf {
+                    Some(pdf_page_count(input)? as u32)
+                } else {
+                    None
+                };
+                let (schema_json_str, prompt_str) = if is_md {
+                    let md_text = std::fs::read_to_string(&args.schema)?;
+                    let parsed = markdown::parse(&md_text)?;
+                    let section = markdown::resolve_section(&parsed.sections, args.name.as_deref())?;
+                    let schema = parse_schema_content(&section.schema)?;
+                    (serde_json::to_string(&schema)?, section.prompt.to_string())
+                } else {
+                    let schema: serde_json::Value = serde_json::from_str(&js_runner::run(&args.schema)?)?;
+                    let prompt = args.prompt.as_deref().unwrap_or("Extract the structured data from this image.").to_string();
+                    (serde_json::to_string(&schema)?, prompt)
+                };
+                let conn = db.as_ref().unwrap().lock().unwrap();
+                if sqlite::extraction_exists(&conn, &sqlite::ExistsCheck {
+                    input_file: input,
+                    page: effective_page,
+                    page_count,
+                    model: &args.model,
+                    schema_json: &schema_json_str,
+                    prompt: &prompt_str,
+                })? {
+                    eprintln!("Skipped: extraction already exists (use --force to re-extract)");
+                    return Ok(());
+                }
+            }
+
             let ea = ExtractArgs {
                 schema: &args.schema,
                 input,
@@ -908,7 +948,26 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
             None
         };
 
+        let schema_json_str = serde_json::to_string(&json_schema)?;
+        let force = args.force;
+
         let cr = run_concurrent(nc, &page_list, |page_num, w| {
+            if !force {
+                let conn = db.lock().unwrap();
+                if sqlite::extraction_exists(&conn, &sqlite::ExistsCheck {
+                    input_file: input,
+                    page: Some(page_num),
+                    page_count,
+                    model,
+                    schema_json: &schema_json_str,
+                    prompt: prompt_str,
+                })? {
+                    drop(conn);
+                    w.status(page_num, "skipped (exists)");
+                    return Ok(true);
+                }
+            }
+
             w.status(page_num, "extracting image");
             let (image_bytes, mime) =
                 get_image_bytes(input, Some(page_num), screenshot)?;
@@ -941,7 +1000,7 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
                 )?;
             }
 
-            Ok(())
+            Ok(false)
         }, |page_num, e| {
             eprintln!("  page {page_num}: {e:#}");
             let conn = db.lock().unwrap();
@@ -953,17 +1012,11 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
             });
         });
 
-        let msg = if cr.error_count > 0 {
-            format!(
-                "Extracted {} pages ({} errors) into {}",
-                total - cr.error_count, cr.error_count, args.output.as_ref().unwrap().display()
-            )
-        } else {
-            format!(
-                "Extracted {total} pages into {}",
-                args.output.as_ref().unwrap().display()
-            )
-        };
+        let msg = format_summary(
+            "Extracted",
+            total, cr.skip_count, cr.error_count,
+            &format!("pages into {}", args.output.as_ref().unwrap().display()),
+        );
         cr.prog.finish(&msg);
         return Ok(());
     }
@@ -1019,8 +1072,28 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
         let total = page_list.len();
         let nc = args.concurrency.min(total).max(1);
 
+        let schema_json_str = serde_json::to_string(&json_schema)?;
+        let force = args.force;
+
         let cr = run_concurrent(nc, &page_list, |page_num, w| {
             let effective_page = if page_num == 0 { None } else { Some(page_num) };
+
+            if !force {
+                let conn = db.lock().unwrap();
+                if sqlite::extraction_exists(&conn, &sqlite::ExistsCheck {
+                    input_file: input,
+                    page: effective_page,
+                    page_count,
+                    model,
+                    schema_json: &schema_json_str,
+                    prompt: prompt_str,
+                })? {
+                    drop(conn);
+                    w.status(page_num, "skipped (exists)");
+                    return Ok(true);
+                }
+            }
+
             w.status(page_num, "extracting image");
             let (image_bytes, mime) =
                 get_image_bytes(input, effective_page, screenshot)?;
@@ -1053,7 +1126,7 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
                 )?;
             }
 
-            Ok(())
+            Ok(false)
         }, |page_num, e| {
             let effective_page = if page_num == 0 { None } else { Some(page_num) };
             eprintln!("  {}: {e:#}", input.display());
@@ -1066,31 +1139,43 @@ pub fn run_command(args: CommandArgs) -> anyhow::Result<()> {
             });
         });
 
-        let msg = if cr.error_count > 0 {
-            format!(
-                "Extracted {} from {} ({} errors) into {}",
-                total - cr.error_count, input.display(), cr.error_count,
-                args.output.as_ref().unwrap().display()
-            )
-        } else {
-            format!(
-                "Extracted {} from {} into {}",
-                total, input.display(), args.output.as_ref().unwrap().display()
-            )
-        };
+        let msg = format_summary(
+            "Extracted",
+            total, cr.skip_count, cr.error_count,
+            &format!("from {} into {}", input.display(), args.output.as_ref().unwrap().display()),
+        );
         cr.prog.finish(&msg);
     }
 
     Ok(())
 }
 
+fn format_summary(verb: &str, total: usize, skipped: usize, errors: usize, suffix: &str) -> String {
+    let processed = total - skipped - errors;
+    let mut parts = vec![format!("{processed}")];
+    if skipped > 0 {
+        parts.push(format!("{skipped} skipped"));
+    }
+    if errors > 0 {
+        parts.push(format!("{errors} errors"));
+    }
+    if parts.len() == 1 {
+        format!("{verb} {processed} {suffix}")
+    } else {
+        let detail = parts[1..].join(", ");
+        format!("{verb} {processed} ({detail}) {suffix}")
+    }
+}
+
 struct ConcurrentResult {
     prog: Progress,
     error_count: usize,
+    skip_count: usize,
 }
 
 /// Process pages concurrently with up to `nc` worker threads.
 /// The callback should handle its own persistence (e.g. SQLite inserts).
+/// Return Ok(true) to indicate a skip (already exists), Ok(false) for normal completion.
 /// On error, `on_error` is called and work continues with the remaining pages.
 fn run_concurrent<F, E>(
     nc: usize,
@@ -1099,13 +1184,14 @@ fn run_concurrent<F, E>(
     on_error: E,
 ) -> ConcurrentResult
 where
-    F: Fn(u32, &Worker<'_>) -> anyhow::Result<()> + Sync,
+    F: Fn(u32, &Worker<'_>) -> anyhow::Result<bool> + Sync,
     E: Fn(u32, &anyhow::Error) + Sync,
 {
     let total = page_list.len();
     let prog = Progress::new(total, nc);
     let work = Mutex::new(page_list.iter().copied());
     let error_count = std::sync::atomic::AtomicUsize::new(0);
+    let skip_count = std::sync::atomic::AtomicUsize::new(0);
 
     std::thread::scope(|s| {
         for worker_idx in 0..nc {
@@ -1114,6 +1200,7 @@ where
             let process = &process;
             let on_error = &on_error;
             let error_count = &error_count;
+            let skip_count = &skip_count;
 
             s.spawn(move || {
                 let w = prog.worker(worker_idx);
@@ -1127,7 +1214,10 @@ where
                     };
 
                     match process(page_num, &w) {
-                        Ok(()) => {
+                        Ok(skipped) => {
+                            if skipped {
+                                skip_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             w.complete_page();
                         }
                         Err(e) => {
@@ -1144,5 +1234,6 @@ where
     ConcurrentResult {
         prog,
         error_count: error_count.load(std::sync::atomic::Ordering::Relaxed),
+        skip_count: skip_count.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
