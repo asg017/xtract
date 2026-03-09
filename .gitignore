@@ -1,6 +1,5 @@
 /target
 node_modules
-bundle.js
 
 *.db
 *.db-shm
