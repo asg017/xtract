@@ -30,4 +30,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - run: npm ci
+        working-directory: js
       - run: cargo test
